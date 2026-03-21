@@ -1,291 +1,641 @@
-#include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <time.h>
 #include <hdf5.h>
 
-#ifdef DOUBLE_FFTW
-#include <drfftw_mpi.h>
-#else
-#include <rfftw_mpi.h>
-#endif
-
 #include "header.h"
+#include "colormap.h"
 
 #define BUFSIZE 500
-
 #define rhocrit 27.755
 
 #include <png.h>
 
-void find_neighbours(int num_part,float *smoothing_length, int num_ngb,
-		     float *posx, float *posy, float *posz,
-		     float xmin, float ymin, float zmin);
+#ifdef ENABLE_MPI
+#include <mpi.h>
+#endif
 
+void find_neighbours(int num_part, float *smoothing_length, int num_ngb,
+                     float *posx, float *posy, float *posz,
+                     float xmin, float ymin, float zmin, float sph_eta);
+void find_neighbours_fast(int num_part, float *smoothing_length, int num_ngb,
+                           float *posx, float *posy, float *posz,
+                           float xmin, float ymin, float zmin,
+                           float sph_eta, const char *cache_file, int render_width);
+void find_neighbours_cached(int num_part, float *smoothing_length, int num_ngb,
+                             float *posx, float *posy, float *posz,
+                             float xmin, float ymin, float zmin,
+                             float sph_eta, const char *cache_file);
 
-float finterpolant(float xmin, float xmax);
-
-/*
-void setRGB(png_byte *ptr, float val);
-
-void setRGB(png_byte *ptr, float val)
-{
-  int v = (int)(val * 768);
-  if (v < 0) v = 0;
-  if (v > 768) v = 768;
-  int offset = v % 256;
-  
-  if (v<256) {
-    ptr[0] = 0; ptr[1] = 0; ptr[2] = 0; ptr[3]=offset;
-  }
-  else if (v>256&&v<512) {
-    ptr[0] = 0; ptr[1]=0; ptr[2] = offset; ptr[3] = 255-offset;
-  }
-  else {
-    ptr[0] = offset; ptr[1] = 0; ptr[2]= 255-offset; ptr[3] = offset;
-  }
-}
-*/
-#define IMAGE_DIMENSION 1024
+#define IMAGE_DIMENSIONX  768
+#define IMAGE_DIMENSIONY  768
 #define MAX_COLOUR_COMPONENT_VALUE 255
-#define FMIN 2.5e-10
 
-static rfftwnd_mpi_plan fft_forward_plan, fft_inverse_plan;
-static int fftsize, maxfftsize;
-static fftw_complex *fft_of_rhogrid;
-
-struct linking_list {
-    int num;
-    struct linking_list *ptr;
-};
-
-typedef struct linking_list LIST;
+static void print_usage(const char *prog)
+{
+    fprintf(stdout,
+        "Usage: %s -input <file>           Input snapshot root\n"
+        "          -output <file>          Output image root\n"
+        "          [-isHDF5]               HDF5 format (default: binary)\n"
+        "          [-units 0|1]            0=raw, 1=box-normalised coords\n"
+        "          [-xc <val>]             x centre\n"
+        "          [-yc <val>]             y centre\n"
+        "          [-zc <val>]             z centre\n"
+        "          [-lbox <val>]           View box side length\n"
+        "          [-itmax <N>]            N frames, fixed box (default 1)\n"
+        "          [-zoom <N>]             N frames, box shrinks each iter\n"
+        "          [-zoom_factor <f>]      Zoom factor per iter, 0<f<1 (default 0.5)\n"
+        "          [-rot_dangle <deg>]     Degrees to rotate per frame\n"
+        "          [-rot_axis x,y,z]       Rotation axis (default 0,0,1=z)\n"
+        "          [-ptype <N>]            Keep particle type N (repeatable)\n"
+        "          [-all_types]            Keep all particle types\n"
+        "          [-gas]                  Shorthand: keep type 0\n"
+        "          [-dark_matter]          Shorthand: keep type 1\n"
+        "          [-stars]                Shorthand: keep type 4\n"
+        "\n"
+        "Colour / opacity options:\n"
+        "          [-scene <n>]      Preset: cluster | scattered | filament\n"
+        "          [-colormap <name>]      Palette name (see below)\n"
+        "          [-reverse_colormap]     Reverse the palette\n"
+        "          [-opacity <val>]        Global opacity [0,1] (default 1)\n"
+        "          [-opacity_func <name>]  Transfer function (see below)\n"
+        "          [-opacity_gamma <val>]  Exponent for 'power' function\n"
+        "          [-opacity_threshold <v>] Cutoff value for 'threshold'\n"
+        "          [-vmin <val>]           Lower density clip (log10 units)\n"
+        "          [-vmax <val>]           Upper density clip (log10 units)\n"
+        "          [-linear_scale]         Use linear (not log10) density\n"
+        "          [-colormap_file <path>] Load custom palette from file\n"
+        "          [-bg_color R,G,B[,A]]   Background colour in [0,1]\n"
+        "\n"
+        "Available palettes: viridis, magma, inferno, plasma, hot, fire,\n"
+        "                    ice, grayscale, coolwarm, custom\n"
+        "Opacity functions:  flat, linear, sqrt, power, log, threshold\n"
+        "\nDensity scaling (auto-levels on by default):\n"
+        "          [-no_auto_levels]       Use fixed vmin/vmax instead\n"
+        "          [-lock_levels]          Auto-level on frame 0, lock for all frames\n"
+        "          [-auto_pct_lo <val>]    Low  clip percentile 0-1 (default 0.001)\n"
+        "          [-auto_pct_hi <val>]    High clip percentile 0-1 (default 0.999)\n"
+        "  With -no_auto_levels, -vmin/-vmax set fixed log10 density bounds\n"
+        "\nKernel smoothing options (requires -DKERNEL_SMOOTHING):\n"
+        "          [-num_ngb <N>]          Neighbours for h estimate (default 32)\n"
+        "          [-sph_eta <val>]        h = eta*dist_Nth_ngb (default 1.2)\n"
+        "          [-sph_cache <file>]     cache smoothing lengths to file\n"
+        "                                  (reloaded on next run if n/ngb/eta match)\n"
+        "          [-fast_smooth]          O(N) grid h estimator (~0.3s) vs KNN (~30s)\n"
+        "          Larger eta: smoother; smaller eta: sharper but noisier\n"
+        "\n3-D grid options:\n"
+        "          [-ngrid_z <N>]          Depth of 3-D density grid (default=image width)\n"
+        "          Reduce for lower memory use, e.g. -ngrid_z 64\n",
+        prog);
+    fflush(stdout);
+}
 
 int main(int argc, char *argv[])
 {
-  int i,j,k,l,m,n,buf[BUFSIZE];
-  char filename[128],image_file[128],image_file_root[128],debug_file[128];
-  FILE *infile,*outfile;
-  char buffer[BUFSIZE];
-  double SliceSize,ImageSliceSize,f_Image=0.1;
-  double mp;
+    int i, j;
+    char file_root[256]       = "";
+    char filename[256]        = "";
+    char image_file[256]      = "";
+    char image_file_root[256] = "";
 
-  int nsend,nrec;
+    long long NumPart = 0, NumPartRead = 0;
 
-  float *send, *rec;
-  int *isend, *irec;
+    float *x = NULL, *y = NULL, *z = NULL;
+    int   *ptype = NULL;
+    float *smoothing_length = NULL;
 
+    int isHDF5        = 0;
+    int isDistributed = 0;
 
-  char junk[256-24];
-  long long NumPart=0, NumPartInFile=0;
-  long long fileoffset;
+    struct sim_info header;
+    memset(&header, 0, sizeof(header));
 
-  float pos[3];
-  float *x,*y,*z;
-  int *ptype;
-  float *posx,*posy,*posz;
-  int *partid;
-  float *smoothing_length;
-  float xmin,ymin,zmin;
-  float xmax,ymax,zmax;
-  double sum,sumx,sumy,sumz;
+    int ptype_mask = (1 << 1);   /* default: dark matter */
 
-  int PMGRID;
-	
-  float fslice=0.1;
-  
-  int NSlab;
-  int Nmesh;
-  int nx,ny,nz;
-  int ix,iy,iz;
-  int jx,jy,jz;
-  int kx,ky,kz;  
-  long long num_x[BUFSIZE]={0},num_gather[BUFSIZE]={0};
-  long long num_proc=0, num_tot=0;
+    double xcen = 0.5, ycen = 0.5, zcen = 0.5;
+    double xc = 0.0, yc = 0.0, zc = 0.0, lbox = 0.0;
+    int itmax    = 1;
+    int zoom          = 0;       /* -zoom N: shrink box each iter            */
+    float zoom_factor = 0.5f;   /* -zoom_factor f: multiply box by f per iter */
+    int boxunits = 0;
 
-  double dx,dy,dz;
-    
-  int isHDF5=0;
-  int rank;
-  float *dummy;
+    /* Rotation: axis (unit vector) and degrees per frame.
+     * Default axis is z (0,0,1) — rotates in the x-y plane.
+     * Use -rot_axis x,y,z and -rot_dangle deg to change. */
+    float rot_axis[3]  = {0.0f, 0.0f, 1.0f};
+    float rot_dangle   = 0.0f;   /* degrees per frame; 0 = no rotation */
 
-  float hx0,hy0,hz0,hx1,hy1,hz1;
-  int lcount;
-  hsize_t dims[2],start[2],count[2];
-  hid_t hdf5_file, hdf5_headergrp, hdf5_grp, hdf5_attribute, hdf5_datatype, hdf5_dataset, hdf5_dataspace_in_file, hdf5_dataspace_in_memory;
+    /* Colour / opacity configuration – start from defaults */
+    render_config_t rcfg;
+    render_config_default(&rcfg);
+    int lock_levels = 0;  /* -lock_levels: auto-level once on frame 0, then fix */
 
-  struct sim_info header;
+    clock_t tstart, tfinish;
+    int   ngrid_z   = 0;     /* depth of 3-D grid; 0 = same as image width */
+    int   num_ngb   = 32;    /* neighbours for smoothing length estimate */
+    char  sph_cache[512] = "";  /* -sph_cache <file>: cache smoothing lengths */
+    int   fast_smooth   = 0;    /* -fast_smooth: O(N) grid estimator */
+    float sph_eta   = 1.2f;  /* h = eta * dist_to_Nth_neighbour           */
 
-  long long NumPartRead=0;
+#ifdef ENABLE_MPI
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
+    MPI_Comm_size(MPI_COMM_WORLD, &NTask);
+#else
+    ThisTask = 0;
+    NTask    = 1;
+#endif
 
-  int ptype_keep;
-
-  float BoundingBox;
-
-  int itmax;
-  
-  ThisTask=0;
-  NTask=0;
-  
-  // Now check that user input is correct
-  if(argc<2)
-    {
-      fprintf(stdout,"Usage: %s <filename> (<isHDF5>)\n",argv[0]); fflush(stdout);
-      exit(0);
-    }
-  
-  i=1;
-
-  double xc=0.0,yc=0.0,zc=0.0,lbox=0.0;
-
-  while(i<argc)
-    {
-      if(strcmp(argv[i],"-input")==0)
-	sprintf(filename,"%s",argv[++i]);
-      
-      if(strcmp(argv[i],"-output")==0)
-	sprintf(image_file_root,"%s",argv[++i]);      
-      
-      if(strcmp(argv[i],"-xc")==0)
-	xc=atof(argv[++i]);
-
-      if(strcmp(argv[i],"-yc")==0)
-	yc=atof(argv[++i]);
-
-      if(strcmp(argv[i],"-zc")==0)
-	zc=atof(argv[++i]);
-
-      if(strcmp(argv[i],"-lbox")==0)
-	lbox=atof(argv[++i]);
-
-      if(strcmp(argv[i],"-itmax")==0)
-	itmax=atoi(argv[++i]);      
-
-      if(strcmp(argv[i],"-isHDF5")==0) isHDF5=1;
-      if(strcmp(argv[i],"-stars")==0) ptype_keep=5;
-      if(strcmp(argv[i],"-gas")==0) ptype_keep=0;
-      if(strcmp(argv[i],"-dark_matter")==0) ptype_keep=1;      
-
-      i++;
+    if (argc < 2) {
+        if (ThisTask == 0) print_usage(argv[0]);
+#ifdef ENABLE_MPI
+        MPI_Finalize();
+#endif
+        return 0;
     }
 
-  if(isHDF5==1){
-    fprintf(stdout,"Assuming HDF5 input...\n");
-    fflush(stdout);
-    sprintf(filename,"%s.hdf5",filename);
-  }
+    /* ---- Parse command line ---- */
+    i = 1;
+    while (i < argc) {
+        /* Positional / simulation args */
+        if      (strcmp(argv[i], "-input")  == 0) sprintf(file_root,       "%s", argv[++i]);
+        else if (strcmp(argv[i], "-output") == 0) sprintf(image_file_root, "%s", argv[++i]);
+        else if (strcmp(argv[i], "-units")  == 0) boxunits = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-xc")     == 0) xcen     = atof(argv[++i]);
+        else if (strcmp(argv[i], "-yc")     == 0) ycen     = atof(argv[++i]);
+        else if (strcmp(argv[i], "-zc")     == 0) zcen     = atof(argv[++i]);
+        else if (strcmp(argv[i], "-lbox")   == 0) lbox     = atof(argv[++i]);
+        else if (strcmp(argv[i], "-itmax")  == 0) itmax    = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-isHDF5") == 0) isHDF5   = 1;
 
-  if((infile=fopen(filename,"r"))==0)
-    {
-      sprintf(filename,"%s.0",argv[1]);
-      if((infile=fopen(filename,"r"))==0)
-        {
-	  fprintf(stdout,"Error: cannot find input file as either %s or %s\n ",argv[1],filename);
-	  fflush(stdout);
-	  exit(0);
+        /* Particle type selection */
+        else if (strcmp(argv[i], "-all_types")   == 0) ptype_mask = -1;
+        else if (strcmp(argv[i], "-gas")         == 0) {
+            if (ptype_mask == (1 << 1)) ptype_mask = 0;
+            ptype_mask |= (1 << 0);
         }
-    }
-  
-  fprintf(stdout,"Filename: %s\n",filename);
-  
-  if(xc>0 || lbox>0)
-    {
-      fprintf(stdout,"Centre: (%g|%g|%g) \n",xc,yc,zc);
-      fprintf(stdout,"Box Length: %g\n",lbox);
-    }
-	  
-  
-  // File exists - now let's get some basic information. For simplicity, do this on Task 0.
+        else if (strcmp(argv[i], "-dark_matter") == 0) ptype_mask |= (1 << 1);
+        else if (strcmp(argv[i], "-stars")       == 0) {
+            if (ptype_mask == (1 << 1)) ptype_mask = 0;
+            ptype_mask |= (1 << 4);
+        }
+        else if (strcmp(argv[i], "-ptype") == 0) {
+            int t = atoi(argv[++i]);
+            if (t >= 0 && t < (int)(sizeof(int)*8)) {
+                if (ptype_mask == (1 << 1)) ptype_mask = 0;
+                ptype_mask |= (1 << t);
+            }
+        }
 
-  char *var = (char*)filename;
-  char temp[1024]={};
-  
-  i=0;
-  
-  while (*var)
+
+        /* ---- Scene presets ---- */
+        else if (strcmp(argv[i], "-scene") == 0) {
+            const char *scene = argv[++i];
+            if (strcmp(scene, "cluster") == 0) {
+                /* One dominant halo: sqrt opacity compresses bright core
+                 * so outskirts remain visible. magma, tight lo clip. */
+                rcfg.auto_pct_lo   = 0.05f;
+                rcfg.auto_pct_hi   = 1.0f;
+                rcfg.opacity_func  = OPACITY_SQRT;
+                rcfg.global_alpha  = 1.0f;
+                rcfg.colormap      = CMAP_MAGMA;
+                rcfg.log_scale     = 1;
+            } else if (strcmp(scene, "scattered") == 0) {
+                /* Many halos at similar densities: flat opacity gives
+                 * equal visual weight to all. plasma, wider lo clip. */
+                rcfg.auto_pct_lo   = 0.10f;
+                rcfg.auto_pct_hi   = 1.0f;
+                rcfg.opacity_func  = OPACITY_FLAT;
+                rcfg.global_alpha  = 1.0f;
+                rcfg.colormap      = CMAP_PLASMA;
+                rcfg.log_scale     = 1;
+            } else if (strcmp(scene, "filament") == 0) {
+                /* Large-scale structure: power opacity (gamma=0.5)
+                 * compresses dense nodes so filaments stay visible.
+                 * inferno, very low lo clip to show faint sheets. */
+                rcfg.auto_pct_lo   = 0.02f;
+                rcfg.auto_pct_hi   = 1.0f;
+                rcfg.opacity_func  = OPACITY_POWER;
+                rcfg.opacity_gamma = 0.5f;
+                rcfg.global_alpha  = 1.0f;
+                rcfg.colormap      = CMAP_INFERNO;
+                rcfg.log_scale     = 1;
+            } else {
+                fprintf(stderr,
+                    "Unknown -scene '%s'. Options: cluster, scattered, filament\n",
+                    scene);
+            }
+        }
+
+        /* ---- Colour / opacity args ---- */
+        else if (strcmp(argv[i], "-colormap") == 0)
+            render_config_parse_arg(&rcfg, "colormap", argv[++i]);
+
+        else if (strcmp(argv[i], "-reverse_colormap") == 0)
+            rcfg.reverse = 1;
+
+        else if (strcmp(argv[i], "-opacity") == 0)
+            render_config_parse_arg(&rcfg, "opacity", argv[++i]);
+
+        else if (strcmp(argv[i], "-opacity_func") == 0)
+            render_config_parse_arg(&rcfg, "opacity_func", argv[++i]);
+
+        else if (strcmp(argv[i], "-opacity_gamma") == 0)
+            render_config_parse_arg(&rcfg, "opacity_gamma", argv[++i]);
+
+        else if (strcmp(argv[i], "-opacity_threshold") == 0)
+            render_config_parse_arg(&rcfg, "opacity_threshold", argv[++i]);
+
+        else if (strcmp(argv[i], "-vmin") == 0)
+            render_config_parse_arg(&rcfg, "vmin", argv[++i]);
+
+        else if (strcmp(argv[i], "-vmax") == 0)
+            render_config_parse_arg(&rcfg, "vmax", argv[++i]);
+
+        else if (strcmp(argv[i], "-linear_scale") == 0)
+            rcfg.log_scale = 0;
+
+        else if (strcmp(argv[i], "-colormap_file") == 0)
+            render_config_parse_arg(&rcfg, "colormap_file", argv[++i]);
+
+        else if (strcmp(argv[i], "-bg_color") == 0)
+            render_config_parse_arg(&rcfg, "bg_color", argv[++i]);
+
+        else if (strcmp(argv[i], "-zoom") == 0)
+            zoom = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-zoom_factor") == 0) {
+            zoom_factor = (float)atof(argv[++i]);
+            if (zoom_factor <= 0.0f || zoom_factor >= 1.0f) {
+                fprintf(stderr, "zoom_factor must be in (0,1), got %g — using 0.5\n",
+                        zoom_factor);
+                zoom_factor = 0.5f;
+            }
+        }
+        else if (strcmp(argv[i], "-rot_axis") == 0) {
+            /* Expect "x,y,z" — normalised below */
+            sscanf(argv[++i], "%f,%f,%f",
+                   &rot_axis[0], &rot_axis[1], &rot_axis[2]);
+            float len = sqrtf(rot_axis[0]*rot_axis[0] +
+                               rot_axis[1]*rot_axis[1] +
+                               rot_axis[2]*rot_axis[2]);
+            if (len > 0.0f) {
+                rot_axis[0] /= len;
+                rot_axis[1] /= len;
+                rot_axis[2] /= len;
+            }
+        }
+        else if (strcmp(argv[i], "-rot_dangle") == 0)
+            rot_dangle = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "-num_ngb") == 0)
+            num_ngb = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-sph_eta") == 0)
+            sph_eta = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "-sph_cache") == 0)
+            snprintf(sph_cache, sizeof(sph_cache), "%s", argv[++i]);
+        else if (strcmp(argv[i], "-fast_smooth") == 0)
+            fast_smooth = 1;
+        else if (strcmp(argv[i], "-ngrid_z") == 0)
+            ngrid_z = atoi(argv[++i]);
+
+        /* Auto-levels: on by default, can be disabled */
+        else if (strcmp(argv[i], "-no_auto_levels") == 0)
+            rcfg.auto_levels = 0;
+        else if (strcmp(argv[i], "-lock_levels") == 0)
+            lock_levels = 1;
+        else if (strcmp(argv[i], "-auto_pct_lo") == 0)
+            render_config_parse_arg(&rcfg, "auto_pct_lo", argv[++i]);
+        else if (strcmp(argv[i], "-auto_pct_hi") == 0)
+            render_config_parse_arg(&rcfg, "auto_pct_hi", argv[++i]);
+
+        i++;
+    }
+
+    /* ---- Setup ---- */
+    check_input_filenames(filename, file_root, isHDF5, &isDistributed);
+
+    if (ThisTask == 0) {
+        if (xcen > 0 || lbox > 0) {
+            fprintf(stdout, "Centre: (%g|%g|%g)\n", xcen, ycen, zcen);
+            fprintf(stdout, "Box Length: %g\n", lbox);
+        }
+        fprintf(stdout, "Render configuration:\n");
+        render_config_print(&rcfg);
+        fprintf(stdout, "Reading header...\n");
+        fflush(stdout);
+    }
+
+    if (isHDF5)
+        read_hdf5_header(filename, &header, &NumPart);
+    else
+        read_gadget_binary_header(filename, &header, &NumPart);
+
+    if (ThisTask == 0) {
+        fprintf(stdout, "Number of particle types in file: %d\n",
+                header.num_types);
+        for (i = 0; i < (int)(sizeof(int)*8); i++) {
+            if (ptype_mask != -1 && !(ptype_mask & (1 << i))) continue;
+            if (i >= header.num_types || header.nall[i] == 0)
+                fprintf(stdout,
+                    "Warning: type %d requested but not present\n", i);
+        }
+        fflush(stdout);
+    }
+
+    if (header.BoxSize == 0)
+        header.BoxSize = 1.e6;
+    else if (boxunits == 1) {
+        xcen *= header.BoxSize; ycen *= header.BoxSize;
+        zcen *= header.BoxSize; lbox *= header.BoxSize;
+    }
+    xc = xcen; yc = ycen; zc = zcen;
+
+    if (ThisTask == 0) {
+        fprintf(stdout, "Number of files: %d\n",       header.NumFiles);
+        fprintf(stdout, "Number of particles: %lld\n", NumPart);
+        fprintf(stdout, "Time/Expansion Factor: %g\n", header.time);
+        fflush(stdout);
+    }
+
+    x     = (float *)malloc(sizeof(float) * NumPart);
+    y     = (float *)malloc(sizeof(float) * NumPart);
+    z     = (float *)malloc(sizeof(float) * NumPart);
+    ptype = (int   *)malloc(sizeof(int)   * NumPart);
+
+    if (ThisTask == 0) { fprintf(stdout, "Reading particles...\n"); fflush(stdout); }
+
+    if (isHDF5)
+        read_particles_from_hdf5(file_root, x, y, z, ptype,
+                                  header.NumFiles, &NumPartRead);
+    else
+        read_particles_from_gadget_binary(file_root, x, y, z, ptype,
+                                           header.NumFiles, &NumPartRead);
+
+    select_particles(x, y, z, ptype, header.BoxSize, NumPartRead,
+                     xc, yc, zc, lbox, ptype_mask, &NumPart);
+
+#ifdef ENABLE_MPI
+    split_across_tasks_as_slabs(x, y, z, &NumPart, xc, yc, zc,
+                             (float)lbox, (float)header.BoxSize);
+    MPI_Barrier(MPI_COMM_WORLD);
+#endif
+
+    if (NumPart == 0) {
+        if (ThisTask == 0)
+            fprintf(stdout, "Error: no particles selected (mask=0x%x)\n",
+                    (unsigned)ptype_mask);
+#ifdef ENABLE_MPI
+        MPI_Finalize();
+#endif
+        return 1;
+    }
+
+    if (ThisTask == 0) {
+        fprintf(stdout, "Plotting %lld particles (type mask 0x%x)...\n",
+                NumPart, (unsigned)ptype_mask);
+        fflush(stdout);
+    }
+
+#ifdef KERNEL_SMOOTHING
+    /*
+     * Adaptive smoothing lengths for SPH kernel deposit.
+     * Not needed for CIC mode — smooth_to_mesh ignores smoothing_length
+     * when KERNEL_SMOOTHING is not defined.
+     */
+    smoothing_length = (float *)malloc(sizeof(float) * NumPart);
+    if (!smoothing_length) {
+        fprintf(stderr, "malloc failed for smoothing_length\n");
+        return 1;
+    }
     {
-      temp[i++]=*var;
-      if(strncmp(var,".",1)==0)
-        {
-	  break;
+        float xmin_v = (float)(xc - 0.5 * lbox);
+        float ymin_v = (float)(yc - 0.5 * lbox);
+        float zmin_v = (float)(zc - 0.5 * lbox);
+        tstart = clock();
+        /* Pass physical voxel size as xmin_v so find_neighbours can apply
+         * a resolution-based h cap.  ymin_v/zmin_v are unused by the new code. */
+        float vox_size_v = (float)lbox / (float)IMAGE_DIMENSIONX;
+        if (fast_smooth) {
+            find_neighbours_fast((int)NumPart, smoothing_length, num_ngb,
+                                 x, y, z, vox_size_v, 0.0f, 0.0f, sph_eta,
+                                 sph_cache[0] ? sph_cache : NULL,
+                                 IMAGE_DIMENSIONX);
         } else {
-	var++;
-      }
+            find_neighbours_cached((int)NumPart, smoothing_length, num_ngb,
+                                   x, y, z, vox_size_v, 0.0f, 0.0f, sph_eta,
+                                   sph_cache[0] ? sph_cache : NULL);
+        }
+        tfinish = clock();
+        fprintf(stdout, "find_neighbours - time: %.2f s\n",
+                (double)(tfinish - tstart) / CLOCKS_PER_SEC);
+        fflush(stdout);
+    }
+#else
+    smoothing_length = NULL;   /* CIC deposit does not use smoothing lengths */
+    fprintf(stdout, "CIC deposit mode (no kernel smoothing)\n");
+    fflush(stdout);
+#endif
+
+    /* ---- Render loop ---- */
+    /*
+     * smooth_to_mesh fills data[][] with raw density values.
+     * We pass the raw data and the full render_config_t to
+     * write_to_png_ex, which applies normalisation, colourmap, and
+     * opacity in one pass — avoiding an extra loop over the image.
+     */
+    float *data        = (float *)calloc(IMAGE_DIMENSIONX * IMAGE_DIMENSIONY,
+                                          sizeof(float));
+    float *global_data = (float *)calloc(IMAGE_DIMENSIONX * IMAGE_DIMENSIONY,
+                                          sizeof(float));
+
+    float BoundingBox = (float)lbox;
+    float theta       = 0.0f;
+
+    /*
+     * Render loop — itmax frames, fixed bounding box by default.
+     *
+     * Modes:
+     *   -itmax N              N frames, fixed box (rotation if -rot_dangle set)
+     *   -zoom  N [-zoom_factor f]  N frames, box multiplied by f each iter (default 0.5)
+     *   -itmax N -rot_dangle D  N frames rotating D degrees per frame around
+     *                            rot_axis through (xc,yc,zc)
+     *
+     * Rotation is implemented by rotating a working copy of the particle
+     * coordinates around the view centre before each deposit.  The original
+     * arrays are untouched so frame 0 always matches a non-rotating render.
+     *
+     * Rodrigues rotation formula:
+     *   v_rot = v*cos(a) + (k x v)*sin(a) + k*(k.v)*(1-cos(a))
+     * where k is the unit rotation axis and a is the angle in radians.
+     */
+    int n_frames = (zoom > 0) ? zoom : itmax;
+
+    /* Working coordinate arrays for rotation */
+    float *rx = (float *)malloc(NumPart * sizeof(float));
+    float *ry = (float *)malloc(NumPart * sizeof(float));
+    float *rz = (float *)malloc(NumPart * sizeof(float));
+    if (!rx || !ry || !rz) {
+        fprintf(stderr, "malloc failed for rotation buffers");
+        return 1;
     }
 
-  if(isHDF5==1) 
-    read_hdf5_header(filename, &header, &NumPart);
-  else
-    read_gadget_binary_header(filename, &header, &NumPart);
+    for (int iter = 0; iter < n_frames; iter++) {
+        memset(data,        0, IMAGE_DIMENSIONX * IMAGE_DIMENSIONY * sizeof(float));
+        memset(global_data, 0, IMAGE_DIMENSIONX * IMAGE_DIMENSIONY * sizeof(float));
 
-  if(header.BoxSize==0) header.BoxSize=1.e6;
-  
-  // Echo the cosmological parameters to stdout
-  fprintf(stdout,"Omega0 %g OmegaLambda %g HubbleParam %g\n",header.Omega0,header.OmegaLambda,header.HubbleParam);
-  fprintf(stdout,"NumPart %lld NumFiles %d BoxSize %g time %g mp %g\n",NumPart,header.NumFiles,header.BoxSize,header.time,mp);
-  fflush(stdout);
+        /* Apply cumulative rotation for this frame.
+         * Angle = iter * rot_dangle (degrees).  For iter=0 this is 0 so
+         * rx/ry/rz == x/y/z and the first frame is always un-rotated. */
+        {
+            float angle_rad = (float)(iter) * rot_dangle * (float)M_PI / 180.0f;
+            float ca = cosf(angle_rad), sa = sinf(angle_rad);
+            float kx = rot_axis[0], ky = rot_axis[1], kz = rot_axis[2];
+            for (long long pi = 0; pi < NumPart; pi++) {
+                float vx = x[pi] - (float)xc;
+                float vy = y[pi] - (float)yc;
+                float vz = z[pi] - (float)zc;
+                float kdotv = kx*vx + ky*vy + kz*vz;
+                /* cross product k x v */
+                float cx_ = ky*vz - kz*vy;
+                float cy_ = kz*vx - kx*vz;
+                float cz_ = kx*vy - ky*vx;
+                rx[pi] = (float)xc + vx*ca + cx_*sa + kx*kdotv*(1.0f - ca);
+                ry[pi] = (float)yc + vy*ca + cy_*sa + ky*kdotv*(1.0f - ca);
+                rz[pi] = (float)zc + vz*ca + cz_*sa + kz*kdotv*(1.0f - ca);
+            }
+        }
 
-  // Allocate memory....
+        tstart = clock();
+        smooth_to_mesh(NumPart, smoothing_length, rx, ry, rz,
+                       xc, yc, zc, BoundingBox,
+                       (float)(ngrid_z > 0 ? ngrid_z : IMAGE_DIMENSIONX),
+                       IMAGE_DIMENSIONX, IMAGE_DIMENSIONY, data);
+        tfinish = clock();
+        fprintf(stdout, "smooth_to_mesh - time: %.2f s\n",
+                (double)(tfinish - tstart) / CLOCKS_PER_SEC);
+        fflush(stdout);
 
-  x = (float*)malloc(sizeof(float)*NumPart);
-  y = (float*)malloc(sizeof(float)*NumPart);
-  z = (float*)malloc(sizeof(float)*NumPart);
-  ptype = (int*)malloc(sizeof(int)*NumPart);  
+#ifdef ENABLE_MPI
+        MPI_Reduce(data, global_data,
+                   IMAGE_DIMENSIONX * IMAGE_DIMENSIONY,
+                   MPI_FLOAT, MPI_SUM, 0, MPI_COMM_WORLD);
+#else
+        memcpy(global_data, data,
+               IMAGE_DIMENSIONX * IMAGE_DIMENSIONY * sizeof(float));
+#endif
 
-  if(isHDF5==1)
-    read_particles_from_hdf5(temp,x,y,z,ptype,header.NumFiles,&NumPartRead);    
-  else
-    read_particles_from_gadget_binary(temp,x,y,z,ptype,header.NumFiles,&NumPartRead);    
+        if (ThisTask == 0) {
+            /* Apply noise floor globally after MPI_Reduce(SUM).
+             * Must be done here — not per-task — because each task has a
+             * different local dmax, so per-task noise floors are inconsistent
+             * and create visible stripe artefacts at slab boundaries.
+             * A single global dmax gives a consistent threshold everywhere. */
+            int npix_g = IMAGE_DIMENSIONX * IMAGE_DIMENSIONY;
+            float gdmax = 0.0f;
+            for (int p = 0; p < npix_g; p++)
+                if (global_data[p] > gdmax) gdmax = global_data[p];
+            /*
+             * Noise floor: zero pixels below 0.01% of the peak.
+             * 1e-4 (vs the old 1e-6) aggressively suppresses corner
+             * speckle from boundary particles with poorly-sampled kernels,
+             * while staying well below any real density structure.
+             * At dmax~5600 (log10=3.75) this zeros anything below ~0.56,
+             * i.e. log10 < -0.25 — safely above the corner noise level.
+             */
+            float noise_floor = gdmax * 1.0e-4f;
+            if (noise_floor > 0.0f)
+                for (int p = 0; p < npix_g; p++)
+                    if (global_data[p] < noise_floor) global_data[p] = 0.0f;
 
-  fprintf(stdout,"Read particles...\n");
-  fflush(stdout);
-  
-  select_particles(x,y,z,ptype,header.BoxSize,NumPartRead,xc,yc,zc,lbox,ptype_keep,&NumPart);
-  
-  //  split_across_tasks_as_slabs(x,y,z,pid,NumPartRead,BoxSize);
+            /*
+             * CIC zero-hole inpainting.
+             *
+             * With ~0.03 particles/voxel on a 768³ grid the CIC 2×2×2
+             * stencil leaves contiguous empty regions several pixels wide
+             * after projection.  A fixed-radius blur needs many passes to
+             * fill large holes and risks blurring real structure.
+             *
+             * Instead we use iterative 3×3 propagation: each pass expands
+             * the filled frontier by one pixel in every direction.  We
+             * repeat until no zero pixels remain inside the data extent, or
+             * we hit MAX_FILL_PASSES.  Only zero pixels are ever written;
+             * non-zero pixels are never modified, so dynamic range and
+             * sharpness of real structure are fully preserved.
+             *
+             * MAX_FILL_PASSES = 64 handles holes up to ~64 px across, which
+             * comfortably covers the worst-case CIC aliasing at this
+             * resolution.  Each pass is O(npix) so total cost is negligible.
+             */
+            {
+#define MAX_FILL_PASSES 64
+                float *buf = (float *)malloc((size_t)npix_g * sizeof(float));
+                if (buf) {
+                    memcpy(buf, global_data, (size_t)npix_g * sizeof(float));
+                    int changed = 1;
+                    for (int pass = 0; pass < MAX_FILL_PASSES && changed; pass++) {
+                        changed = 0;
+                        for (int row = 1; row < IMAGE_DIMENSIONY - 1; row++) {
+                            for (int col = 1; col < IMAGE_DIMENSIONX - 1; col++) {
+                                int pidx = row * IMAGE_DIMENSIONX + col;
+                                if (buf[pidx] > 0.0f) continue; /* already filled */
+                                float sum = 0.0f; int nn = 0;
+                                for (int dy = -1; dy <= 1; dy++)
+                                    for (int dx = -1; dx <= 1; dx++) {
+                                        float v = buf[(row+dy)*IMAGE_DIMENSIONX+(col+dx)];
+                                        if (v > 0.0f) { sum += v; nn++; }
+                                    }
+                                if (nn > 0) {
+                                    global_data[pidx] = sum / (float)nn;
+                                    changed = 1;
+                                }
+                            }
+                        }
+                        /* Sync buf so next pass sees this pass's fills */
+                        memcpy(buf, global_data, (size_t)npix_g * sizeof(float));
+                    }
+                    free(buf);
+                }
+#undef MAX_FILL_PASSES
+            }
 
-  smoothing_length = (float*)malloc(2*sizeof(float)*(NumPart));  
+            sprintf(image_file, "%s.%04d.png", image_file_root, iter);
+            write_to_png_ex(image_file,
+                            IMAGE_DIMENSIONX, IMAGE_DIMENSIONY,
+                            global_data, &rcfg);
 
-  float dxmin[3]={0,0,0};
-  int num_ngb=40;
+            /*
+             * Lock levels after frame 0 when -lock_levels is set.
+             * auto_levels_from_data() has already run inside write_to_png_ex
+             * and stored vmin/vmax in rcfg.  Disabling auto_levels now means
+             * all subsequent frames use the same stretch, preventing colormap
+             * flicker in rotation/zoom animations.
+             */
+            if (lock_levels && iter == 0 && rcfg.auto_levels) {
+                rcfg.auto_levels = 0;
+                fprintf(stdout, "Levels locked: vmin=%.3f vmax=%.3f\n",
+                        rcfg.vmin, rcfg.vmax);
+                fflush(stdout);
+            }
+        }
 
-  clock_t tstart=clock();  
-  find_neighbours(NumPart,smoothing_length,num_ngb,x,y,z,dxmin[0],dxmin[1],dxmin[2]);
-  clock_t tfinish=clock()-tstart;
 
-  fprintf(stdout,"find_neighbours - time: %lu s...\n",tfinish/CLOCKS_PER_SEC); 
-  fflush(stdout);
-  
-  float data[IMAGE_DIMENSION][IMAGE_DIMENSION];
-
-  BoundingBox=lbox;
-  float theta=0.;
-  int iter=0;
-  
-  while(BoundingBox>0.01*lbox)
-    {
-      tstart=tfinish;
-      smooth_to_mesh(NumPart,smoothing_length,num_ngb,x,y,z,xc,yc,zc,BoundingBox,theta,IMAGE_DIMENSION,IMAGE_DIMENSION,*data);
-      tfinish=clock()-tstart;    
-      fprintf(stdout,"smooth_to_mesh - time: %lu s...\n",tfinish/CLOCKS_PER_SEC); 
-      fflush(stdout);        
-      
-      sprintf(image_file,"%s.%d.%s",image_file_root,iter,"png");  
-      
-      //write_to_ppm(image_file,IMAGE_DIMENSION,IMAGE_DIMENSION,MAX_COLOUR_COMPONENT_VALUE,*data);
-      write_to_png(image_file,IMAGE_DIMENSION,IMAGE_DIMENSION,*data);      
-      BoundingBox/=1.025;
-      theta+=2*M_PI/72.0;
-      iter++;
-      if(iter>itmax-1) break;
+        /* Shrink the view box only when in zoom mode */
+        if (zoom > 0) BoundingBox *= zoom_factor;
     }
+    free(rx); free(ry); free(rz);
 
+    free(data); free(global_data);
+    free(x); free(y); free(z); free(ptype);
+    if (smoothing_length) free(smoothing_length);
+    sim_info_free(&header);
 
-  /*
+    fprintf(stdout, "Finished...\n");
+    fflush(stdout);
 
-*/  
-  fprintf(stdout,"Finished...\n");
-  fflush(stdout);
+#ifdef ENABLE_MPI
+    MPI_Finalize();
+#endif
+    return 0;
 }
