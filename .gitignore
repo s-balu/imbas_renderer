@@ -1,0 +1,9 @@
+.ipynb_checkpoints
+*.ipynb
+.DS_Store
+*.dSYM
+*.exe
+*.o
+*.hcache
+*.png
+snap*.hcache
