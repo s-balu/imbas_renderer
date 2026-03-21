@@ -30,8 +30,12 @@ void find_neighbours_cached(int num_part, float *smoothing_length, int num_ngb,
                              float xmin, float ymin, float zmin,
                              float sph_eta, const char *cache_file);
 
+#ifndef IMAGE_DIMENSIONX
 #define IMAGE_DIMENSIONX  768
+#endif
+#ifndef IMAGE_DIMENSIONY
 #define IMAGE_DIMENSIONY  768
+#endif
 #define MAX_COLOUR_COMPONENT_VALUE 255
 
 static void print_usage(const char *prog)
@@ -79,6 +83,16 @@ static void print_usage(const char *prog)
         "          [-auto_pct_lo <val>]    Low  clip percentile 0-1 (default 0.001)\n"
         "          [-auto_pct_hi <val>]    High clip percentile 0-1 (default 0.999)\n"
         "  With -no_auto_levels, -vmin/-vmax set fixed log10 density bounds\n"
+        "\nTime interpolation options:\n"
+        "          [-interp_frac <f>]      Interpolate positions by fraction f in [0,1]\n"
+        "                                  using velocities from the input snapshot.\n"
+        "                                  f=0: snapshot positions; f=1: one full\n"
+        "                                  snapshot interval ahead. Use with -itmax N\n"
+        "                                  to generate sub-frame interpolated sequences.\n"
+        "          [-snap_dt <val>]        Time interval between snapshots in simulation\n"
+        "                                  units (used to scale velocity displacement).\n"
+        "                                  If omitted, velocities are used as raw offsets\n"
+        "                                  scaled only by interp_frac.\n"
         "\nKernel smoothing options (requires -DKERNEL_SMOOTHING):\n"
         "          [-num_ngb <N>]          Neighbours for h estimate (default 32)\n"
         "          [-sph_eta <val>]        h = eta*dist_Nth_ngb (default 1.2)\n"
@@ -87,8 +101,9 @@ static void print_usage(const char *prog)
         "          [-fast_smooth]          O(N) grid h estimator (~0.3s) vs KNN (~30s)\n"
         "          Larger eta: smoother; smaller eta: sharper but noisier\n"
         "\n3-D grid options:\n"
-        "          [-ngrid_z <N>]          Depth of 3-D density grid (default=image width)\n"
-        "          Reduce for lower memory use, e.g. -ngrid_z 64\n",
+        "          [-ngrid_z <N>]          Depth of 3-D density grid (default=min(width,256))\n"
+        "          Reduce for lower memory use, e.g. -ngrid_z 64\n"
+        "          At 4K+ always set this explicitly to avoid huge allocations\n",
         prog);
     fflush(stdout);
 }
@@ -134,10 +149,12 @@ int main(int argc, char *argv[])
     int lock_levels = 0;  /* -lock_levels: auto-level once on frame 0, then fix */
 
     clock_t tstart, tfinish;
-    int   ngrid_z   = 0;     /* depth of 3-D grid; 0 = same as image width */
+    int   ngrid_z   = 0;     /* depth of 3-D grid; 0 = auto (see below)  */
     int   num_ngb   = 32;    /* neighbours for smoothing length estimate */
     char  sph_cache[512] = "";  /* -sph_cache <file>: cache smoothing lengths */
     int   fast_smooth   = 0;    /* -fast_smooth: O(N) grid estimator */
+    float interp_frac   = 0.0f; /* -interp_frac f: fractional position interpolation */
+    float snap_dt       = 0.0f; /* -snap_dt val: snapshot time interval (sim units) */
     float sph_eta   = 1.2f;  /* h = eta * dist_to_Nth_neighbour           */
 
 #ifdef ENABLE_MPI
@@ -297,6 +314,10 @@ int main(int argc, char *argv[])
             snprintf(sph_cache, sizeof(sph_cache), "%s", argv[++i]);
         else if (strcmp(argv[i], "-fast_smooth") == 0)
             fast_smooth = 1;
+        else if (strcmp(argv[i], "-interp_frac") == 0)
+            interp_frac = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "-snap_dt") == 0)
+            snap_dt = (float)atof(argv[++i]);
         else if (strcmp(argv[i], "-ngrid_z") == 0)
             ngrid_z = atoi(argv[++i]);
 
@@ -390,6 +411,58 @@ int main(int argc, char *argv[])
         MPI_Finalize();
 #endif
         return 1;
+    }
+
+    /*
+     * Velocity interpolation: shift particle positions by frac * v * dt
+     * to generate sub-snapshot frames between two outputs.
+     *
+     * This produces smooth transitions in a time sequence without needing
+     * to store or read a second snapshot.  The approximation is first-order
+     * (straight-line motion), which is accurate for small fractions of the
+     * snapshot interval and breaks down near strong interactions.
+     *
+     * Usage:
+     *   -interp_frac 0.5          half-step forward using snapshot velocities
+     *   -snap_dt 0.05             snapshot interval in simulation time units
+     *
+     * If -snap_dt is omitted, velocities are used as raw offsets (useful when
+     * you just want to explore the velocity field visually).
+     *
+     * To generate N interpolated frames between snapshots A and B:
+     *   for f in $(seq 0 0.1 1.0); do
+     *     ./render_image.exe -input snapA ... -interp_frac $f -snap_dt 0.05
+     *   done
+     */
+    if (interp_frac != 0.0f && isHDF5) {
+        float *vx = (float *)malloc(sizeof(float) * NumPart);
+        float *vy = (float *)malloc(sizeof(float) * NumPart);
+        float *vz = (float *)malloc(sizeof(float) * NumPart);
+
+        if (vx && vy && vz) {
+            long long nvel = 0;
+            read_velocities_from_hdf5(file_root, vx, vy, vz,
+                                       header.NumFiles, &nvel);
+
+            /* Scale factor: interp_frac * dt converts velocity to displacement.
+             * If snap_dt not given, use interp_frac alone as a dimensionless scale. */
+            float scale = (snap_dt > 0.0f) ? interp_frac * snap_dt : interp_frac;
+
+            fprintf(stdout,
+                "Interpolating positions: frac=%.3f  dt=%g  scale=%g\n",
+                interp_frac, snap_dt, scale);
+            fflush(stdout);
+
+            for (long long k = 0; k < NumPart; k++) {
+                x[k] += scale * vx[k];
+                y[k] += scale * vy[k];
+                z[k] += scale * vz[k];
+            }
+        } else {
+            fprintf(stderr, "Warning: could not allocate velocity arrays — "
+                    "skipping interpolation\n");
+        }
+        free(vx); free(vy); free(vz);
     }
 
     if (ThisTask == 0) {
@@ -507,10 +580,18 @@ int main(int argc, char *argv[])
             }
         }
 
+        /* ngrid_z: depth of the 3D CIC grid in z-slices.
+         * Defaulting to IMAGE_DIMENSIONX would give a cubic grid —
+         * 4096^3 at 4K = 256 GB. Cap at 256 slices which is sufficient
+         * for all projection renders and keeps memory sane.
+         * Override explicitly with -ngrid_z if you need finer z-sampling. */
+        int effective_ngrid_z = ngrid_z > 0 ? ngrid_z
+                              : (IMAGE_DIMENSIONX < 256 ? IMAGE_DIMENSIONX : 256);
+
         tstart = clock();
         smooth_to_mesh(NumPart, smoothing_length, rx, ry, rz,
                        xc, yc, zc, BoundingBox,
-                       (float)(ngrid_z > 0 ? ngrid_z : IMAGE_DIMENSIONX),
+                       (float)effective_ngrid_z,
                        IMAGE_DIMENSIONX, IMAGE_DIMENSIONY, data);
         tfinish = clock();
         fprintf(stdout, "smooth_to_mesh - time: %.2f s\n",

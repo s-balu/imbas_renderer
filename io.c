@@ -377,6 +377,112 @@ void read_particles_from_hdf5(char *temp, float *x, float *y, float *z,
     }
 }
 
+
+/* ------------------------------------------------------------------ */
+/* read_velocities_from_hdf5: read particle velocities into vx/vy/vz. */
+/*                                                                      */
+/* Reads only particle types that pass ptype_mask (same mask used when  */
+/* reading coordinates) and in the same order, so vx[i]/vy[i]/vz[i]   */
+/* corresponds to x[i]/y[i]/z[i].                                       */
+/*                                                                      */
+/* HDF5 dataset: /PartTypeN/Velocities  shape [N,3]  float32           */
+/* Gadget internal units: km/s * sqrt(a) — divide by sqrt(a) for        */
+/* physical km/s; multiply by a*dt/H0 for comoving displacement.        */
+/* For rendering purposes the raw values work fine as a relative shift.  */
+/* ------------------------------------------------------------------ */
+void read_velocities_from_hdf5(char *temp, float *vx, float *vy, float *vz,
+                                int NumFiles, long long *NThisTask)
+{
+    int i, j, k, nfile;
+    char filename[256], groupname[64];
+    float *dummy;
+    int tmp_npart[MAX_TYPE_PROBE];
+    long long n_read = 0;
+
+    for (nfile = 0; nfile < NumFiles; nfile++) {
+        if (NumFiles > 1)
+            sprintf(filename, "%s%d.hdf5", temp, nfile);
+        else
+            sprintf(filename, "%s.hdf5", temp);
+
+        hdf5_file = H5Fopen(filename, H5F_ACC_RDONLY, H5P_DEFAULT);
+        hdf5_headergrp = H5Gopen(hdf5_file, "/Header");
+        hdf5_attribute = H5Aopen_name(hdf5_headergrp, "NumPart_ThisFile");
+        hid_t aspace = H5Aget_space(hdf5_attribute);
+        hsize_t nelem;
+        H5Sget_simple_extent_dims(aspace, &nelem, NULL);
+        H5Sclose(aspace);
+        int num_types_in_file = (int)nelem;
+        memset(tmp_npart, 0, sizeof(tmp_npart));
+        hdf5_status = H5Aread(hdf5_attribute, H5T_NATIVE_INT, tmp_npart);
+        hdf5_status = H5Aclose(hdf5_attribute);
+        hdf5_status = H5Gclose(hdf5_headergrp);
+
+        for (i = 0; i < num_types_in_file; i++) {
+            if (tmp_npart[i] <= 0) continue;
+            sprintf(groupname, "/PartType%d", i);
+            if (H5Lexists(hdf5_file, groupname, H5P_DEFAULT) <= 0) continue;
+
+            /* Check Velocities dataset exists (some formats omit it) */
+            hdf5_grp = H5Gopen(hdf5_file, groupname);
+            if (H5Lexists(hdf5_grp, "Velocities", H5P_DEFAULT) <= 0) {
+                /* Fill with zeros if missing — no shift applied */
+                hsize_t per_task = tmp_npart[i] / NTask;
+                for (j = 0; j < (int)per_task; j++) {
+                    vx[n_read] = vy[n_read] = vz[n_read] = 0.0f;
+                    n_read++;
+                }
+                hdf5_status = H5Gclose(hdf5_grp);
+                continue;
+            }
+
+            hdf5_dataset  = H5Dopen(hdf5_grp, "Velocities");
+            hdf5_datatype = H5Tcopy(H5T_NATIVE_FLOAT);
+
+            rank_g    = 2;
+            dims_g[1] = 3;
+            dims_g[0] = tmp_npart[i];
+            hdf5_dataspace_in_file = H5Screate_simple(rank_g, dims_g, NULL);
+
+            hsize_t per_task = tmp_npart[i] / NTask;
+            dims_g[0] = per_task;
+            hdf5_dataspace_in_memory = H5Screate_simple(rank_g, dims_g, NULL);
+
+            start_g[0] = (hsize_t)ThisTask * per_task;
+            start_g[1] = 0;
+            count_g[0] = per_task;
+            count_g[1] = 3;
+
+            hdf5_status = H5Sselect_hyperslab(hdf5_dataspace_in_file,
+                                               H5S_SELECT_SET,
+                                               start_g, NULL, count_g, NULL);
+
+            dummy = (float *)malloc(3 * sizeof(float) * per_task);
+            hdf5_status = H5Dread(hdf5_dataset, hdf5_datatype,
+                                   hdf5_dataspace_in_memory,
+                                   hdf5_dataspace_in_file,
+                                   H5P_DEFAULT, dummy);
+            k = 0;
+            for (j = 0; j < (int)per_task; j++) {
+                vx[n_read] = dummy[k];
+                vy[n_read] = dummy[k + 1];
+                vz[n_read] = dummy[k + 2];
+                k += 3;
+                n_read++;
+            }
+            free(dummy);
+
+            hdf5_status = H5Sclose(hdf5_dataspace_in_memory);
+            hdf5_status = H5Sclose(hdf5_dataspace_in_file);
+            hdf5_status = H5Tclose(hdf5_datatype);
+            hdf5_status = H5Dclose(hdf5_dataset);
+            hdf5_status = H5Gclose(hdf5_grp);
+        }
+        hdf5_status = H5Fclose(hdf5_file);
+    }
+    *NThisTask = n_read;
+}
+
 /* ------------------------------------------------------------------ */
 /* Gadget binary particle reader                                        */
 /*                                                                      */

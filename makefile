@@ -1,4 +1,6 @@
 OPT += -DCIC
+OPT += -DIMAGE_DIMENSIONX=4096
+OPT += -DIMAGE_DIMENSIONY=4096
 #OPT += -DLONG_IDS
 #OPT += -DVELOCITIES
 #OPT += -DIMAGE
@@ -7,7 +9,7 @@ OPT += -DENABLE_OPENMP
 #OPT += -DENABLE_MPI
 #OPT += -DSCATTER_DECOMPOSITION
 OPT += -DNONPERIODIC
-OPT += -DKERNEL_SMOOTHING
+#OPT += -DKERNEL_SMOOTHING
 #OPT += -DSMOOTH_GRID=512
 
 COMPILE_ON_SYSTEM="MacBook"
@@ -70,7 +72,7 @@ endif
 OPTS=-lm $(OPT) $(PNG_OPTS) $(HDF5_OPTS)
 
 render_image.exe : render_image.c io.c find_neighbours.c make_tree.c walk_tree.c kernels.c split_across_tasks.c select_particles.c header.c smooth_to_mesh.c deposit_sph_2d.c write_to_ppm.c colormap.c
-	$(CC) -o render_image.exe -g $(OPTS) -I$(HDF5_INCL) -I$(PNG_INCL) render_image.c io.c find_neighbours.c make_tree.c walk_tree.c kernels.c split_across_tasks.c select_particles.c header.c smooth_to_mesh.c deposit_sph_2d.c write_to_ppm.c colormap.c -L$(HDF5_LIBS) $(HDF5_OPTS) -L$(PNG_LIBS) $(PNG_OPTS) 
+	$(CC) -o render_image.exe -ffast-math -O3 $(OPTS) -I$(HDF5_INCL) -I$(PNG_INCL) render_image.c io.c find_neighbours.c make_tree.c walk_tree.c kernels.c split_across_tasks.c select_particles.c header.c smooth_to_mesh.c deposit_sph_2d.c write_to_ppm.c colormap.c -L$(HDF5_LIBS) $(HDF5_OPTS) -L$(PNG_LIBS) $(PNG_OPTS) 
 
 clean: 
 	rm render_image.exe

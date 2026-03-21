@@ -24,7 +24,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <time.h>
 
 #ifdef ENABLE_OPENMP
 #include "omp.h"
@@ -298,6 +297,8 @@ static long long deposit_cic_yrange(long long NumPart,
                                 float xc, float yc, float zc, float lbox,
                                 int full_width, int lw, int height, int depth,
                                 int x0_vox, int y_lo, int y_hi,
+                                int y_base,   /* grid row 0 = image row y_base */
+                                int grid_height, /* actual height of dens3d */
                                 grid_t *dens3d)
 {
     float vox_x = (float)full_width / lbox;
@@ -332,7 +333,8 @@ static long long deposit_cic_yrange(long long NumPart,
             if (jz < 0)      jz += depth;
             if (jz >= depth) jz -= depth;
 #endif
-            size_t base_z = (size_t)jz * height * lw;
+            /* Grid is grid_height rows tall; row jy maps to grid row jy - y_base */
+            size_t base_z = (size_t)jz * grid_height * lw;
             for (int dy = 0; dy < 2; dy++) {
                 int jy = iy0 + dy;
                 if (jy < y_lo || jy >= y_hi) continue;
@@ -342,7 +344,9 @@ static long long deposit_cic_yrange(long long NumPart,
                 if (jy < 0)       jy += height;
                 if (jy >= height) jy -= height;
 #endif
-                size_t base_zy = base_z + (size_t)jy * lw;
+                int jy_grid = jy - y_base;   /* index into strip grid */
+                if (jy_grid < 0 || jy_grid >= grid_height) continue;
+                size_t base_zy = base_z + (size_t)jy_grid * lw;
                 float  wzy     = wz[dz] * wy[dy];
                 for (int dx = 0; dx < 2; dx++) {
                     int jx = ix0 + dx;
@@ -426,7 +430,12 @@ void smooth_to_mesh(long long NumPart, float *smoothing_length,
      * projects directly to 2D.  Skip the allocation entirely so we don't
      * waste width*height*depth*4 bytes (8GB at 4096×4096×128). */
     grid_t *dens3d = NULL;
+#elif CIC_STRIP_HEIGHT > 0
+    /* Tiled CIC: strip grids are allocated per-strip below.
+     * No monolithic grid needed here. */
+    grid_t *dens3d = NULL;
 #else
+    /* Original monolithic CIC grid */
     grid_t *dens3d = alloc_grid(lw, height, depth, tag);
     if (!dens3d) {
         memset(data, 0, (size_t)width * height * sizeof(float));
@@ -550,7 +559,109 @@ void smooth_to_mesh(long long NumPart, float *smoothing_length,
 #endif
     fflush(stdout);
 
-#else  /* CIC path: keep 3D deposit + project */
+#else  /* CIC path: tiled strip deposit                               */
+    /*
+     * Tiled CIC deposit for large images (4K / 8K).
+     *
+     * Instead of one monolithic lw×height×depth grid (8 GB at 8K×8K×128),
+     * we process the image in horizontal strips of CIC_STRIP_HEIGHT rows.
+     * Each strip allocates lw×strip_h×depth, which stays under ~300 MB
+     * at any practical resolution:
+     *
+     *   8192×8192×128×4 bytes = 32 GB  (monolithic — impossible)
+     *   8192× 64 ×128×4 bytes = 268 MB (strip — fine)
+     *
+     * For each strip we make a single pass over all particles, depositing
+     * only those whose CIC stencil overlaps the strip's y-rows.  The
+     * fraction of particles processed per strip is strip_h / height, so
+     * total work = N_particles × N_strips × (strip_h / height) = N_particles.
+     * Cost is identical to the monolithic approach; only peak RAM changes.
+     *
+     * OpenMP parallelises within each strip using the existing y-row
+     * decomposition: threads own sub-ranges of [strip_y0, strip_y1).
+     *
+     * Set CIC_STRIP_HEIGHT at compile time:
+     *   -DCIC_STRIP_HEIGHT=64   (default — 268 MB at 8K, 134 MB at 4K)
+     *   -DCIC_STRIP_HEIGHT=128  (faster for small images, 2× memory)
+     *   -DCIC_STRIP_HEIGHT=0    (disable tiling — use full grid, original behaviour)
+     */
+#ifndef CIC_STRIP_HEIGHT
+#define CIC_STRIP_HEIGHT 64
+#endif
+
+#if CIC_STRIP_HEIGHT > 0
+    {
+        const int strip_h = CIC_STRIP_HEIGHT;
+        const int n_strips = (height + strip_h - 1) / strip_h;
+        long long total_deposited = 0;
+
+        printf("smooth_to_mesh CIC: %d strips of %d rows  "
+               "(grid per strip: %zu MB)\n",
+               n_strips, strip_h,
+               (size_t)lw * strip_h * depth * sizeof(grid_t) / (1024*1024));
+        fflush(stdout);
+
+        memset(data, 0, (size_t)width * height * sizeof(float));
+
+        for (int strip = 0; strip < n_strips; strip++) {
+            int strip_y0 = strip * strip_h;
+            int strip_y1 = strip_y0 + strip_h;
+            if (strip_y1 > height) strip_y1 = height;
+            int this_strip_h = strip_y1 - strip_y0;
+
+            /* Allocate just this strip's grid */
+            grid_t *strip_grid = (grid_t *)calloc(
+                (size_t)lw * this_strip_h * depth, sizeof(grid_t));
+            if (!strip_grid) {
+                fprintf(stderr,
+                    "smooth_to_mesh: failed to allocate strip grid "
+                    "(%zu MB). Try smaller -CIC_STRIP_HEIGHT.\n",
+                    (size_t)lw * this_strip_h * depth * sizeof(grid_t) / (1024*1024));
+                break;
+            }
+
+#ifdef ENABLE_OPENMP
+            int NThreads = omp_get_max_threads();
+            #pragma omp parallel num_threads(NThreads) reduction(+:total_deposited)
+            {
+                int tid    = omp_get_thread_num();
+                /* Thread owns a sub-range within this strip */
+                int thr_y0 = strip_y0 + (long long)tid       * this_strip_h / NThreads;
+                int thr_y1 = strip_y0 + (long long)(tid + 1) * this_strip_h / NThreads;
+                total_deposited += deposit_cic_yrange(NumPart, x, y, z,
+                                   xc, yc, zc, lbox, width, lw, height, depth,
+                                   lx_start, thr_y0, thr_y1,
+                                   strip_y0, this_strip_h, strip_grid);
+            }
+#else
+            total_deposited += deposit_cic_yrange(NumPart, x, y, z,
+                               xc, yc, zc, lbox, width, lw, height, depth,
+                               lx_start, strip_y0, strip_y1,
+                               strip_y0, this_strip_h, strip_grid);
+#endif
+            /* Project this strip's 3D grid into the 2D output image.
+             * project_strip_offset writes only to rows [strip_y0, strip_y1). */
+            for (int iz = 0; iz < depth; iz++) {
+                const grid_t *slice = strip_grid + (size_t)iz * this_strip_h * lw;
+                for (int iy = 0; iy < this_strip_h; iy++) {
+                    const grid_t *src = slice + (size_t)iy * lw;
+                    float *dst = data + (size_t)(strip_y0 + iy) * width + lx_start;
+                    for (int ix = 0; ix < lw; ix++)
+                        dst[ix] += (float)src[ix];
+                }
+            }
+
+            free(strip_grid);
+
+            if (n_strips > 4) {
+                printf("  strip %d/%d done\n", strip + 1, n_strips);
+                fflush(stdout);
+            }
+        }
+        (void)total_deposited;
+    }
+
+#else  /* CIC_STRIP_HEIGHT == 0: original monolithic allocation */
     {
         long long total_deposited = 0;
 #ifdef ENABLE_OPENMP
@@ -564,17 +675,20 @@ void smooth_to_mesh(long long NumPart, float *smoothing_length,
             int y_hi = (long long)(tid + 1) * height / NThreads;
             total_deposited += deposit_cic_yrange(NumPart, x, y, z,
                                xc, yc, zc, lbox, width, lw, height, depth,
-                               lx_start, y_lo, y_hi, dens3d);
+                               lx_start, y_lo, y_hi,
+                               0, height, dens3d);
         }
 #else
         total_deposited = deposit_cic_yrange(NumPart, x, y, z,
                            xc, yc, zc, lbox, width, lw, height, depth,
-                           lx_start, 0, height, dens3d);
+                           lx_start, 0, height,
+                           0, height, dens3d);
 #endif
         (void)total_deposited;
         project_strip(dens3d, lw, height, depth, lx_start, width, data);
         free(dens3d);
     }
+#endif /* CIC_STRIP_HEIGHT > 0 */
 #endif /* KERNEL_SMOOTHING */
 
     report_range(data, width * height);

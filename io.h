@@ -56,6 +56,13 @@ void read_particles_from_hdf5(char *filename,
                                int *ptype, int ptype_mask,
                                long long *NumPartRead);
 
+/* Read particle velocities from HDF5 into vx/vy/vz.
+ * Must be called after read_particles_from_hdf5 with the same file
+ * and ptype_mask so array indices correspond. */
+void read_velocities_from_hdf5(char *filename,
+                                float *vx, float *vy, float *vz,
+                                int NumFiles, long long *NThisTask);
+
 /* ------------------------------------------------------------------ */
 /* Gadget binary reader                                                 */
 /* ------------------------------------------------------------------ */
