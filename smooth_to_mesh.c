@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 #ifdef ENABLE_OPENMP
 #include "omp.h"
@@ -306,6 +307,13 @@ static long long deposit_cic_yrange(long long NumPart,
     float vox_z = (float)depth      / lbox;
     long long n_deposited = 0;
 
+    /* Normalisation: multiply CIC weights by vox_x*vox_y so the projected
+     * image represents column density (particles per lbox^2 of projected area)
+     * rather than particles per voxel.  Without this, doubling the resolution
+     * halves the per-pixel signal because each pixel covers 1/4 the area.
+     * With this factor the image brightness is independent of IMAGE_DIMENSIONX. */
+    float norm = vox_x * vox_y;
+
     for (long long i = 0; i < NumPart; i++) {
         float px = (x[i] - xc) * vox_x + 0.5f * full_width - (float)x0_vox;
         float py = (y[i] - yc) * vox_y + 0.5f * height;
@@ -351,7 +359,7 @@ static long long deposit_cic_yrange(long long NumPart,
                 for (int dx = 0; dx < 2; dx++) {
                     int jx = ix0 + dx;
                     if (jx < 0 || jx >= lw) continue;
-                    dens3d[base_zy + jx] += (grid_t)(wzy * wx[dx]);
+                    dens3d[base_zy + jx] += (grid_t)(wzy * wx[dx] * norm);
                     n_deposited++;
                 }
             }
@@ -531,17 +539,38 @@ void smooth_to_mesh(long long NumPart, float *smoothing_length,
 
         fprintf(stdout, "  h pixel cap: %.1f px (MAX_H_DEPOSIT_PX=%d, 1%%=%.1f px)\n",
                 h_cap_px, MAX_H_DEPOSIT_PX, h_cap_pct);
+
+        /* Skip threshold: omit particles whose kernel exceeds MAX_H_SKIP_PX pixels
+         * even after capping.  These are the most diffuse void particles — their
+         * kernels are enormous (stencil ∝ h²) but they contribute negligible
+         * signal after log-scaling because their local density is near zero.
+         * Skipping them saves the bulk of the deposit time in simulations with
+         * large dynamic range.  The zero pixels they leave are filled by the
+         * inpainting pass in the render loop.
+         *
+         * Default: skip particles with h > 16px (stencil > 33×33 = 1089 pixels).
+         * Override at compile time: -DMAX_H_SKIP_PX=32 keeps more diffuse structure.
+         * Set to a very large value (e.g. 9999) to disable skipping entirely. */
+#ifndef MAX_H_SKIP_PX
+#define MAX_H_SKIP_PX 16
+#endif
+        float h_skip_p = (float)MAX_H_SKIP_PX / vox_inv_p;
+
+        long long n_skipped_diffuse = 0;
         fflush(stdout);
         for (long long i = 0; i < NumPart; i++) {
             float h = smoothing_length[i];
             if (h <= 0.0f) continue;
-            if (h > h_cap_p) h = h_cap_p;
+            if (h > h_skip_p) { n_skipped_diffuse++; continue; }  /* too diffuse — skip */
+            if (h > h_cap_p)  h = h_cap_p;
             packed[n_packed].px = (x[i] - xc) * vox_inv_p + 0.5f * width;
             packed[n_packed].py = (y[i] - yc) * voy_inv_p + 0.5f * height;
             packed[n_packed].h  = h * vox_inv_p;  /* store h in pixels */
             n_packed++;
         }
-        fprintf(stdout, "  packed %lld active particles into AoS\n", n_packed);
+        fprintf(stdout, "  packed %lld active particles into AoS"
+                        "  (skipped %lld diffuse, h>%.1fpx)\n",
+                n_packed, n_skipped_diffuse, (float)MAX_H_SKIP_PX);
         fflush(stdout);
     }
 
@@ -550,6 +579,17 @@ void smooth_to_mesh(long long NumPart, float *smoothing_length,
         (const deposit_particle_t *)packed,
         width, height, data);
     if (packed) free(packed);
+
+    /* Normalise to column density (particles per lbox^2 projected area).
+     * deposit_sph_2d produces values in particles/pixel^2 * h_px^2 = dimensionless
+     * counts per pixel.  Multiply by pixel area in lbox units so brightness
+     * is independent of IMAGE_DIMENSIONX. */
+    {
+        float pixel_area = (lbox / (float)width) * (lbox / (float)height);
+        float norm_sph = 1.0f / pixel_area;
+        int npix = width * height;
+        for (int p = 0; p < npix; p++) data[p] *= norm_sph;
+    }
 #ifdef ENABLE_MPI
     printf("  deposit_sph_2d: %.2f s (wall), %lld pixel writes\n",
            MPI_Wtime() - t_dep, total_deposited);

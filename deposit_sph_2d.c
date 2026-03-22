@@ -75,7 +75,10 @@ long long deposit_sph_2d(long long n_packed,
         int y_lo = 0, y_hi = height, n_rows = height;
         float *local = data2d;
 #endif
-        float dx2[128];
+        /* dx2 must hold up to 2*(2*MAX_H_DEPOSIT_PX)+1 entries.
+         * At MAX_H_DEPOSIT_PX=41px: dnxy = ceil(2*41) = 82, nx <= 2*82+1 = 165.
+         * Use 512 as a safe upper bound for any realistic cap value. */
+        float dx2[512];
 
         for (long long ii = 0; ii < n_packed; ii++) {
             float px    = particles[ii].px;
@@ -96,6 +99,7 @@ long long deposit_sph_2d(long long n_packed,
             int ix0 = (int)px - dnxy; if (ix0 < 0) ix0 = 0;
             int ix1 = (int)px + dnxy + 1; if (ix1 > full_width) ix1 = full_width;
             int nx = ix1 - ix0; if (nx <= 0) continue;
+            if (nx > 512) nx = 512;  /* guard: should never trigger with sane h cap */
 
             for (int k = 0; k < nx; k++) {
                 float dx = (float)(ix0 + k) + 0.5f - px;
