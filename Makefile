@@ -108,8 +108,8 @@ OPTS = -lm $(OPT) $(PNG_OPTS) $(HDF5_OPTS)
 
 OBJS = $(SRCS:.c=.o)
 
-DEPS = $(OBJS:.o=.d)
--include $(DEPS)
+#DEPS = $(OBJS:.o=.d)
+#-include $(DEPS)
 
 render_image : $(OBJS)
 	$(CC) -o $@ $(OBJS) -L$(HDF5_LIBS) $(HDF5_OPTS) -L$(PNG_LIBS) $(PNG_OPTS) -lm
