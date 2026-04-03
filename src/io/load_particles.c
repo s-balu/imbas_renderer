@@ -237,7 +237,7 @@ static int reorder_by_id(const char    *snap_root,
      */
     read_particles_from_hdf5(snap_root,
                              xR, yR, zR,
-                             idR, ptR,
+                             (unsigned long long *)idR, ptR,
                              num_files, &nRead);
 
     /* ---- Sort this snapshot by ID ---- */
@@ -478,7 +478,7 @@ int load_particles_hermite(const cli_args_t      *cfg,
         fprintf(stdout, "Reading snapshot A: %s\n", cfg->snap_a); fflush(stdout);
     }
     read_particles_from_hdf5(cfg->snap_a, xA, yA, zA,
-                              idA,
+                              (unsigned long long *)idA,
                               ptA,
                               header->NumFiles, &nReadA);
 
@@ -719,10 +719,16 @@ int load_particles_hermite3(const cli_args_t      *cfg,
     }
 
     long long nReadA = 0;
+    
     read_particles_from_hdf5(cfg->snap_a,
                              xA, yA, zA,
-                             idA, ptA,
+                             (unsigned long long *)idA,  /* Add this cast */
+                             ptA,
                              header->NumFiles, &nReadA);
+//    read_particles_from_hdf5(cfg->snap_a,
+//                             xA, yA, zA,
+//                             idA, ptA,
+//                             header->NumFiles, &nReadA);
 
     /* Build and sort the reference id_index array */
     id_index_t *ref_sorted = (id_index_t *)malloc(sizeof(id_index_t) * nReadA);
